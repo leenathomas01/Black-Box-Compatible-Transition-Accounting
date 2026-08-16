@@ -1,80 +1,88 @@
 """
-The 'dumb external program' from Phase 0/7.
+Parses the tiny commitment ledger the model emits, and appends it to a JSONL file.
 
-Given the running set of known commitment IDs and the latest turn's ledger,
-flag anything that needs a human/second-pass look:
+Expected model output format (ask for exactly this in the prompt):
 
-  ✓  known commitment, present, status unchanged or legitimately revised (has reason)
-  ↻  revised with a reason attached (fine, just noted)
-  ⚠  known commitment went missing from this turn's ledger with no disposition
-       ("silent loss" — Phase 3B)
-  ?  revised with NO reason given ("false/unexplained revision" — Phase 3C)
+    commitments:
+      C1: retain
+      C2: revise -> E7
+      C3: retain
+
+Optional REGISTER lines for new commitments (Phase 6):
+
+    REGISTER C4 = budget must remain below X
 """
-from dataclasses import dataclass, field
+import json
+import re
+import time
+from pathlib import Path
+
+LEDGER_LINE = re.compile(
+    r"^\s*(C\d+)\s*:\s*(retain|revise)\s*(?:->|→)?\s*([A-Za-z0-9_]*)\s*$",
+    re.IGNORECASE,
+)
+REGISTER_LINE = re.compile(
+    r"^\s*REGISTER\s+(C\d+)\s*=\s*(.+?)\s*$",
+    re.IGNORECASE,
+)
 
 
-@dataclass
-class DiffResult:
-    ok: list = field(default_factory=list)
-    revised: list = field(default_factory=list)
-    missing: list = field(default_factory=list)   # needs inspection
-    unexplained: list = field(default_factory=list)  # needs inspection
+def parse_ledger(raw_text: str) -> dict:
+    """Extract commitments + any new registrations from a model's raw reply.
 
-    @property
-    def needs_inspection(self):
-        return self.missing + self.unexplained
-
-    def render(self) -> str:
-        lines = []
-        for c in self.ok:
-            lines.append(f"{c:<5} ✓")
-        for c in self.revised:
-            lines.append(f"{c:<5} ↻ revised, reason present")
-        for c in self.unexplained:
-            lines.append(f"{c:<5} ?  revised, NO reason given")
-        for c in self.missing:
-            lines.append(f"{c:<5} ⚠  missing disposition")
-        return "\n".join(lines)
-
-
-def diff_turn(known_ids: set, turn_commitments: list) -> DiffResult:
+    Returns:
+        {
+          "commitments": [{"id": "C1", "status": "retain", "reason": None}, ...],
+          "registered": [{"id": "C4", "text": "budget must remain below X"}, ...]
+        }
     """
-    known_ids: set of commitment IDs that were active going into this turn.
-    turn_commitments: list of {"id","status","reason"} from this turn's parsed ledger.
-    """
-    result = DiffResult()
-    seen_this_turn = set()
-
-    for c in turn_commitments:
-        cid = c["id"]
-        seen_this_turn.add(cid)
-        if c["status"] == "retain":
-            result.ok.append(cid)
-        elif c["status"] == "revise":
-            if c.get("reason"):
-                result.revised.append(cid)
-            else:
-                result.unexplained.append(cid)
-
-    for cid in known_ids:
-        if cid not in seen_this_turn:
-            result.missing.append(cid)
-
-    return result
+    commitments = []
+    registered = []
+    for line in raw_text.splitlines():
+        m = LEDGER_LINE.match(line)
+        if m:
+            cid, status, reason = m.groups()
+            commitments.append(
+                {
+                    "id": cid.upper(),
+                    "status": status.lower(),
+                    "reason": reason or None,
+                }
+            )
+            continue
+        r = REGISTER_LINE.match(line)
+        if r:
+            cid, text = r.groups()
+            registered.append({"id": cid.upper(), "text": text})
+    return {"commitments": commitments, "registered": registered}
 
 
-def accounting_vs_validity_stub(diff_results: list, validity_labels: dict) -> dict:
-    """
-    Phase 4 helper. `validity_labels` is your ground truth / human judgment:
-        {"C2@turn3": True/False}  -> was the revision ACTUALLY justified by the evidence?
-    This just gives you the two percentages side by side; the labeling itself
-    has to come from a human or a separate judge model, on purpose (v0 has no judge).
-    """
-    accounted = sum(len(d.revised) + len(d.unexplained) for d in diff_results)
-    valid = sum(1 for v in validity_labels.values() if v)
-    total_labeled = len(validity_labels)
-    return {
-        "accounting_events": accounted,
-        "validity_labeled": total_labeled,
-        "validity_rate": (valid / total_labeled) if total_labeled else None,
-    }
+class LedgerStore:
+    """Appends one JSON record per turn to a JSONL file. Nothing fancier than that."""
+
+    def __init__(self, path: str):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def append(self, record: dict) -> dict:
+        record = {"ts": time.time(), **record}
+        with self.path.open("a") as f:
+            f.write(json.dumps(record) + "\n")
+        return record
+
+    def read_all(self) -> list:
+        if not self.path.exists():
+            return []
+        with self.path.open() as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+    def latest_status(self) -> dict:
+        """Collapse the whole log into {commitment_id: last-known-record}."""
+        status = {}
+        for rec in self.read_all():
+            for c in rec.get("commitments", []):
+                status[c["id"]] = {**c, "turn": rec.get("turn")}
+            for r in rec.get("registered", []):
+                status.setdefault(r["id"], {"id": r["id"], "status": "registered",
+                                             "reason": r["text"], "turn": rec.get("turn")})
+        return status
