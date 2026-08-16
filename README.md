@@ -1,3 +1,5 @@
+### !!! still a work in progress!!
+
 # Commitment Ledger — v0
 
 The "embarrassingly primitive" prototype: model → tiny commitment ledger → JSONL →
